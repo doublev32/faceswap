@@ -1,9 +1,12 @@
 #!/usr/bin/python3.5.3
 
+from PIL import Image
 import dlib
 import cv2
-import numpy as np
 import sys
+import numpy as np
+import math
+import scipy.spatial as spatial
 
 #dlib face detector and predictor initialisation
 trainedModel_Path = "/home/vanv/faceswap/trainedModel/shape_predictor_68_face_landmarks.dat"
@@ -59,129 +62,153 @@ def getLandmarksFromImg(imgFilename):
 			lmPoints.append((x,y))
 
 
-	return img, lmPoints
+	return lmPoints
 
 
-def getDelaunayTriangles(img, faceLandmarks):
+def GetBilinearPixel(imArr, posX, posY, out):
 
-	#using Subdiv2D and delaunays triangulate to triangulate the face
-	size = img.shape
-	rect = (0,0, size[1], size[0])
-	subdiv = cv2.Subdiv2D(rect)
+	#Get integer and fractional parts of numbers
+	modXi = int(posX)
+	modYi = int(posY)
+	modXf = posX - modXi
+	modYf = posY - modYi
+
+	#Get pixels in four corners
+	for chan in range(imArr.shape[2]):
+		bl = imArr[modYi, modXi, chan]
+		br = imArr[modYi, modXi+1, chan]
+		tl = imArr[modYi+1, modXi, chan]
+		tr = imArr[modYi+1, modXi+1, chan]
 	
-	for landmark in faceLandmarks :
-		subdiv.insert(landmark)
+		#Calculate interpolation
+		b = modXf * br + (1. - modXf) * bl
+		t = modXf * tr + (1. - modXf) * tl
+		pxf = modYf * t + (1. - modYf) * b
+		out[chan] = int(pxf+0.5) #Do fast rounding to integer
 
-	# We are getting a list of points of delaunays' triangles
-	# eg : aTriangle = ( (x1,y1), (x2,y2), (x3,y3) )
-	triangleList = subdiv.getTriangleList()
+	return None #Helps with profiling view
+
+def WarpProcessing(inIm, inArr, 
+		outArr, 
+		inTriangle, 
+		triAffines, shape):
+
+	#Ensure images are 3D arrays
+	px = np.empty((inArr.shape[2],), dtype=np.int32)
+	homogCoord = np.ones((3,), dtype=np.float32)
+
+	#Calculate ROI in target image
+	xmin = shape[:,0].min()
+	xmax = shape[:,0].max()
+	ymin = shape[:,1].min()
+	ymax = shape[:,1].max()
+	xmini = int(xmin)
+	xmaxi = int(xmax+1.)
+	ymini = int(ymin)
+	ymaxi = int(ymax+1.)
+	#print xmin, xmax, ymin, ymax
+
+	#Synthesis shape norm image		
+	for i in range(xmini, xmaxi):
+		for j in range(ymini, ymaxi):
+			homogCoord[0] = i
+			homogCoord[1] = j
+
+			#Determine which tesselation triangle contains each pixel in the shape norm image
+			if i < 0 or i >= outArr.shape[1]: continue
+			if j < 0 or j >= outArr.shape[0]: continue
+
+			#Determine which triangle the destination pixel occupies
+			tri = inTriangle[i,j]
+			if tri == -1: 
+				continue
+				
+			#Calculate position in the input image
+			affine = triAffines[tri]
+			outImgCoord = np.dot(affine, homogCoord)
+
+			#Check destination pixel is within the image
+			if outImgCoord[0] < 0 or outImgCoord[0] >= inArr.shape[1]:
+				for chan in range(px.shape[0]): outArr[j,i,chan] = 0
+				continue
+			if outImgCoord[1] < 0 or outImgCoord[1] >= inArr.shape[0]:
+				for chan in range(px.shape[0]): outArr[j,i,chan] = 0
+				continue
+
+			#Nearest neighbour
+			#outImgL[i,j] = inImgL[int(round(inImgCoord[0])),int(round(inImgCoord[1]))]
+
+			#Copy pixel from source to destination by bilinear sampling
+			#print i,j,outImgCoord[0:2],im.size
+			GetBilinearPixel(inArr, outImgCoord[0], outImgCoord[1], px)
+			for chan in range(px.shape[0]):
+				outArr[j,i,chan] = px[chan]
+			#print outImgL[i,j]
+
+	return None
+
+def PiecewiseAffineTransform(srcIm, srcPoints, dstIm, dstPoints):
+
+	#Convert input to correct types
+	srcArr = np.asarray(srcIm, dtype=np.float32)
+	dstPoints = np.array(dstPoints)
+	srcPoints = np.array(srcPoints)
+
+	#Split input shape into mesh
+	tess = spatial.Delaunay(dstPoints)
+
+	#Calculate ROI in target image
+	xmin, xmax = dstPoints[:,0].min(), dstPoints[:,0].max()
+	ymin, ymax = dstPoints[:,1].min(), dstPoints[:,1].max()
+	#print xmin, xmax, ymin, ymax
+
+	#Determine which tesselation triangle contains each pixel in the shape norm image
+	inTessTriangle = np.ones(dstIm.size, dtype=np.int) * -1
+	for i in range(int(xmin), int(xmax+1.)):
+		for j in range(int(ymin), int(ymax+1.)):
+			if i < 0 or i >= inTessTriangle.shape[0]: continue
+			if j < 0 or j >= inTessTriangle.shape[1]: continue
+			normSpaceCoord = (float(i),float(j))
+			simp = tess.find_simplex([normSpaceCoord])
+			inTessTriangle[i,j] = simp
+
+	#Find affine mapping from input positions to mean shape
+	triAffines = []
+	for i, tri in enumerate(tess.vertices):
+		meanVertPos = np.hstack((srcPoints[tri], np.ones((3,1)))).transpose()
+		shapeVertPos = np.hstack((dstPoints[tri,:], np.ones((3,1)))).transpose()
+
+		affine = np.dot(meanVertPos, np.linalg.inv(shapeVertPos)) 
+		triAffines.append(affine)
+
+	#Prepare arrays, check they are 3D	
+	targetArr = np.copy(np.asarray(dstIm, dtype=np.uint8))
+	srcArr = srcArr.reshape(srcArr.shape[0], srcArr.shape[1], len(srcIm.mode))
+	targetArr = targetArr.reshape(targetArr.shape[0], targetArr.shape[1], len(dstIm.mode))
+
+	#Calculate pixel colours
+	WarpProcessing(srcIm, srcArr, targetArr, inTessTriangle, triAffines, dstPoints)
 	
-	# We are recreating a list of delaunays' triangles but this time  
-	# we want the indexes of landmarks and not coordinates of points
-	delaunayTri = []
-	for tri in triangleList:
-		pt = []
+	#Convert single channel images to 2D
+	if targetArr.shape[2] == 1:
+		targetArr = targetArr.reshape((targetArr.shape[0],targetArr.shape[1]))
+	dstIm.paste(Image.fromarray(targetArr))
 
-		pt.append((tri[0], tri[1]))
-		pt.append((tri[2], tri[3]))
-		pt.append((tri[4], tri[5]))
-
-		#searching for corespondance between landmarks idx and delaunays triangles coordinates
-		triIdxs = []
-		for j in range(0, 3):
-			for k in range(0, len(faceLandmarks)):
-				if (abs(pt[j][0] - faceLandmarks[k][0]) < 1.0 and abs(pt[j][1] - faceLandmarks[k][1]) < 1.0):
-					triIdxs.append(k)
-		if len(triIdxs) == 3:
-			delaunayTri.append((triIdxs[0], triIdxs[1], triIdxs[2]))
+if __name__ == "__main__":
+	#Load images
+	srcIm = Image.open(sys.argv[1])
+	dstIm = Image.open(sys.argv[2])
 	
-	#Drawing delaunay triangles (TEMPORARY)
-	for t in delaunayTri :
-		cv2.line(img1, faceLandmarks[t[0]], faceLandmarks[t[1]], (255,255,255), 1)
-		cv2.line(img1, faceLandmarks[t[1]], faceLandmarks[t[2]], (255,255,255), 1)
-		cv2.line(img1, faceLandmarks[t[2]], faceLandmarks[t[0]], (255,255,255), 1)
+	#Get faces landmarks
+	lmPoints1 = getLandmarksFromImg(sys.argv[1])
+	lmPoints2 = getLandmarksFromImg(sys.argv[2])
 
-		
-	return delaunayTri
+	#Perform transform
+	PiecewiseAffineTransform(srcIm, lmPoints1, dstIm, lmPoints2)
 
+	#Save and visualize result
+	dstIm.save("Output.jpg")
+	dstIm.show()
 
-#From two triangles (one of each images) calculate the affine transform
-#and output the target image with the source triangle
-def applyAffineTransform(srcImg, srcTri, targTri, sizeTargRect) :
-	#get the affine transform from the two triangles
-	mat = cv2.getAffineTransform(np.float32(srcTri), np.float32(targTri))
-	
-	#apply the affine transform to the source image
-	targ = cv2.warpAffine( srcImg, mat, (sizeTargRect[0], sizeTargRect[1]), borderMode=cv2.BORDER_REFLECT_101 )
-
-	return targ
-
-
-#Warp and blend a triangular region of the source face into the target face
-def warpTriangle(img1, img2, tri1, tri2):
-
-	
-	#Get the bounding rectangle of the triangles
-	# note :: rect[0] : x, rect[1] : y, rect[2] : w, rect[3] : h
-	rect1 = cv2.boundingRect(np.float32([tri1])) 
-	rect2 = cv2.boundingRect(np.float32([tri2])) 
-
-	#Get coordinates of the triangles corresponding to the bounding rectangle
-	tri1Rect = []
-	tri2Rect = []
-	
-	for i in range(0,3):
-		tri1Rect.append( ((tri1[i][0] - rect1[0]), (tri1[i][1] - rect1[1])) ) 
-		tri2Rect.append( ((tri2[i][0] - rect2[0]), (tri2[i][1] - rect2[1])) ) 
-		
-	#Creating the mask in the shape of the triangle (in B&W)
-	mask = np.zeros( (rect2[3], rect2[2], 3), dtype = np.float32 )
-	cv2.fillConvexPoly(mask, np.int32(tri2Rect), (1.0,1.0,1.0))
-	
-	#get the rectangle part of the image
-	img1Rect = img1[rect1[1]:rect1[1]+rect1[3], rect1[0]:rect1[0]+rect1[2]]
-
-	sizeTargRect = (rect2[2], rect2[3])
-
-	#apply the affine transform
-	img2Rect = applyAffineTransform(img1Rect, tri1Rect, tri2Rect, sizeTargRect)
-
-	#And applying the mask to the bounding rectangle image
-	img2Rect = img2Rect * mask
-
-	#Copy the actual region of the face we want (triangle) to the output image
-	img2[rect2[1]:rect2[1]+rect2[3], rect2[0]:rect2[0]+rect2[2]] = img2[rect2[1]:rect2[1]+rect2[3], rect2[0]:rect2[0]+rect2[2]] * ( (1.0, 1.0, 1.0) - mask )
-
-	img2[rect2[1]:rect2[1]+rect2[3], rect2[0]:rect2[0]+rect2[2]] = img2[rect2[1]:rect2[1]+rect2[3], rect2[0]:rect2[0]+rect2[2]] + img2Rect 
-
-
-
-#### MAIN ########
-
-#Get faces landmarks
-img1, lmPoints1 = getLandmarksFromImg(sys.argv[1])
-img2, lmPoints2 = getLandmarksFromImg(sys.argv[2])
-img1Warped = np.copy(img2)
-
-#since we will be only swapping the face we only triangulate the face contour landmarks
-#(got the face contour landmarks indixes by displaying them on the img)
-facePoints1 = [lmPoints1[i] for i in range(0,27)]
-delaunayTri1 = getDelaunayTriangles(img1, lmPoints1)
-
-facePoints2 = [lmPoints2[i] for i in range(0,27)]
-delaunayTri2 = getDelaunayTriangles(img2, facePoints2)
-
-
-
-for i in range(0, len(delaunayTri2)):
-	tri1 = [ facePoints1[delaunayTri1[i][0]], facePoints1[delaunayTri1[i][1]], facePoints1[delaunayTri1[i][2]] ]
-	tri2 = [ facePoints2[delaunayTri2[i][0]], facePoints2[delaunayTri2[i][1]], facePoints2[delaunayTri2[i][2]] ]
-
-	warpTriangle(img1, img1Warped, tri1, tri2)
-
-
-
-# outup the image+landmarks into a file
-cv2.imwrite("Output.jpg", img1)
 
 
