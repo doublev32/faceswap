@@ -6,6 +6,7 @@ import cv2
 import sys
 import numpy as np
 import math
+import os
 import scipy.spatial as spatial
 
 #dlib face detector and predictor initialisation
@@ -13,6 +14,17 @@ trainedModel_Path = "/home/vanv/faceswap/trainedModel/shape_predictor_68_face_la
 detector = dlib.get_frontal_face_detector()
 predictor = dlib.shape_predictor(trainedModel_Path)
 
+MOUTH_POINTS = list(range(48, 61))
+RIGHT_BROW_POINTS = list(range(17, 22))
+LEFT_BROW_POINTS = list(range(22, 27))
+RIGHT_EYE_POINTS = list(range(36, 42))
+LEFT_EYE_POINTS = list(range(42, 48))
+NOSE_POINTS = list(range(27, 35))
+
+OVERLAY_POINTS = [
+    LEFT_EYE_POINTS + RIGHT_EYE_POINTS + LEFT_BROW_POINTS + RIGHT_BROW_POINTS,
+    NOSE_POINTS + MOUTH_POINTS,
+]
 
 # take a bounding predicted by dlib and convert it
 # to the format (x, y, w, h)
@@ -58,11 +70,11 @@ def getLandmarksFromImg(imgFilename):
 		# loop over the coordinates (landmarks)
 		# and draw them on the image 
 		for (x, y) in shape:
-			cv2.circle(img, (x, y), 3, (255, 0, 0), -1)
+			#cv2.circle(img, (x, y), 3, (255, 0, 0), -1)
 			lmPoints.append((x,y))
 
 
-	return lmPoints
+	return img, lmPoints
 
 
 def GetBilinearPixel(imArr, posX, posY, out):
@@ -192,23 +204,141 @@ def PiecewiseAffineTransform(srcIm, srcPoints, dstIm, dstPoints):
 	#Convert single channel images to 2D
 	if targetArr.shape[2] == 1:
 		targetArr = targetArr.reshape((targetArr.shape[0],targetArr.shape[1]))
-	dstIm.paste(Image.fromarray(targetArr))
+	return Image.fromarray(targetArr)
 
-if __name__ == "__main__":
-	#Load images
-	srcIm = Image.open(sys.argv[1])
-	dstIm = Image.open(sys.argv[2])
+
+
+def createMaskFromImg(lmPoints, img):
+	#Reduce mask by around 3 pixels (Erosion Opencv)
 	
-	#Get faces landmarks
-	lmPoints1 = getLandmarksFromImg(sys.argv[1])
-	lmPoints2 = getLandmarksFromImg(sys.argv[2])
+	# Calculate Mask
+	hull = []
+
+	hullIndex = cv2.convexHull(np.array(lmPoints), returnPoints = False)
+		  
+	for i in range(0, len(hullIndex)):
+		hull.append(lmPoints[int(hullIndex[i])])
+
+	hull8U = []
+	for i in range(0, len(hull)):
+		hull8U.append((hull[i][0], hull[i][1]))
+
+	mask = np.zeros(img.shape, dtype = img.dtype)  
+
+	cv2.fillConvexPoly(mask, np.int32(hull8U), (255, 255, 255))
+
+	return hull, mask
+
+
+def seamlessCloneImgs( srcIm, dstIm, cvDstIm, lmPointsSrc, lmPointsDst ):
 
 	#Perform transform
-	PiecewiseAffineTransform(srcIm, lmPoints1, dstIm, lmPoints2)
+	swappedFacesImg = PiecewiseAffineTransform(srcIm, lmPointsSrc, dstIm, lmPointsDst)
 
-	#Save and visualize result
-	dstIm.save("Output.jpg")
-	dstIm.show()
+	#convert the after warp image in opencv image type
+	swappedFacesImg = np.array(swappedFacesImg)
+	swappedFacesImg = swappedFacesImg[:,:,::-1].copy()
+	#cv2.imwrite("swappedFacesImg.jpg", swappedFacesImg)
+
+	hull, mask = createMaskFromImg(lmPointsDst, cvDstIm)
+	kernel = np.ones((5,5),np.uint8)
+	mask = cv2.erode(mask, kernel, iterations=3)
+	#cv2.imwrite("mask.jpg", mask)
+
+	#get center of face
+	r = cv2.boundingRect(np.float32([hull]))    
+	center = ((r[0]+int(r[2]/2), r[1]+int(r[3]/2)))
+
+	# Clone seamlessly.
+	output = cv2.seamlessClone(np.uint8(swappedFacesImg), cvDstIm, mask, center, cv2.MIXED_CLONE)
+	#cv2.imwrite("Output.jpg", output)
+
+	return output
+	
+def imageResize(image, height):
+	dim = None
+	(h, w) = image.shape[:2]
+
+	# calculate the ratio of the height and construct the
+	# dimensions
+	r = height / float(h)
+	dim = (int(w * r), height)
+
+	# resize the image
+	resized = cv2.resize(image, dim, interpolation = cv2.INTER_AREA)
+
+	# return the resized image
+	return resized
 
 
+def faceSwap(srcImgPath, dstImgPath) : 
+	#Load images
+	srcIm = Image.open(srcImgPath)
+	dstIm = Image.open(dstImgPath)
+	
+	#Get faces landmarks
+	cvImg1, lmPoints1 = getLandmarksFromImg(srcImgPath)
+	cvImg2, lmPoints2 = getLandmarksFromImg(dstImgPath)
+
+	faceOnlyLm1 = []
+	faceOnlyLm2 = []
+	for group in OVERLAY_POINTS:
+		for p in group:
+			faceOnlyLm1.append(lmPoints1[p])
+			faceOnlyLm2.append(lmPoints2[p])
+
+	#Perform swapping
+	output_NoID = seamlessCloneImgs( srcIm, dstIm, cvImg2, lmPoints1, lmPoints2 )
+	output_ID = seamlessCloneImgs( srcIm, dstIm, cvImg2, faceOnlyLm1, faceOnlyLm2 )
+
+
+	#Create a combined image with: source image + destination image + identity preserved + identity not preserved
+	(h, w) = cvImg2.shape[:2]
+	cvImg1 = imageResize(cvImg1, h)
+	combinedImg = np.concatenate((cvImg1, cvImg2, output_NoID, output_ID), axis=1)
+	#cv2.imwrite("Result.jpg", combinedImg)
+	
+	return combinedImg, h
+
+
+
+if __name__ == "__main__":
+	
+	
+	folderPath = sys.argv[1]
+
+	imgsPath = []
+	for path, subdir, files in os.walk(folderPath):
+		for f in files :
+			imgsPath.append(os.path.join(path, f))
+
+	imgCount = 0
+	heights = []
+	for f in imgsPath:
+		for g in imgsPath:
+			if ( f != g ) :
+				print (f + " + " + g)
+				img, height = faceSwap(f,g)
+				heights.append(height)
+				cv2.imwrite("resultImages/result"+str(imgCount)+".jpg", img)
+				imgCount += 1
+
+
+	htmlStr = """
+<html>
+	<body>
+"""
+	
+	for i in range(0,len(heights)):
+		htmlStr += """
+		<img src="resultImages/result"""+str(i)+""".jpg" />
+		"""
+
+	htmlStr += """
+	</body>
+</html>
+"""
+	HtmlFile = open("resultHtml.html", "w")
+	HtmlFile.write(htmlStr)
+	HtmlFile.close()
 
