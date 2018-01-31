@@ -14,18 +14,6 @@ trainedModel_Path = "/home/vanv/faceswap/trainedModel/shape_predictor_68_face_la
 detector = dlib.get_frontal_face_detector()
 predictor = dlib.shape_predictor(trainedModel_Path)
 
-MOUTH_POINTS = list(range(48, 61))
-RIGHT_BROW_POINTS = list(range(17, 22))
-LEFT_BROW_POINTS = list(range(22, 27))
-RIGHT_EYE_POINTS = list(range(36, 42))
-LEFT_EYE_POINTS = list(range(42, 48))
-NOSE_POINTS = list(range(27, 35))
-
-OVERLAY_POINTS = [
-    LEFT_EYE_POINTS + RIGHT_EYE_POINTS + LEFT_BROW_POINTS + RIGHT_BROW_POINTS,
-    NOSE_POINTS + MOUTH_POINTS,
-]
-
 # take a bounding predicted by dlib and convert it
 # to the format (x, y, w, h)
 def rectToBoundingBox(rect):
@@ -50,9 +38,7 @@ def getNpArrFromShape(shape, dtype="int"):
 
 
 #get landmarks of a face from an image file
-def getLandmarksFromImg(imgFilename):
-	#reading the image
-	img = cv2.imread(imgFilename, cv2.IMREAD_COLOR)
+def getLandmarksFromImg(img):
 
 	#getting the shape from dlib's detector
 	lm = detector(img, 1)
@@ -65,16 +51,15 @@ def getLandmarksFromImg(imgFilename):
 		#and convert into list of coordinates
 		shape = predictor(img, mark)
 		shape = getNpArrFromShape(shape)
-	 
-		# TEMPORARY ::::
+
 		# loop over the coordinates (landmarks)
-		# and draw them on the image 
+		# and add them to the result list
 		for (x, y) in shape:
 			#cv2.circle(img, (x, y), 3, (255, 0, 0), -1)
 			lmPoints.append((x,y))
 
 
-	return img, lmPoints
+	return lmPoints
 
 
 def GetBilinearPixel(imArr, posX, posY, out):
@@ -100,10 +85,7 @@ def GetBilinearPixel(imArr, posX, posY, out):
 
 	return None #Helps with profiling view
 
-def WarpProcessing(inIm, inArr, 
-		outArr, 
-		inTriangle, 
-		triAffines, shape):
+def WarpProcessing(inIm, inArr,  outArr,  inTriangle,  triAffines, shape):
 
 	#Ensure images are 3D arrays
 	px = np.empty((inArr.shape[2],), dtype=np.int32)
@@ -147,8 +129,6 @@ def WarpProcessing(inIm, inArr,
 				for chan in range(px.shape[0]): outArr[j,i,chan] = 0
 				continue
 
-			#Nearest neighbour
-			#outImgL[i,j] = inImgL[int(round(inImgCoord[0])),int(round(inImgCoord[1]))]
 
 			#Copy pixel from source to destination by bilinear sampling
 			#print i,j,outImgCoord[0:2],im.size
@@ -207,6 +187,89 @@ def PiecewiseAffineTransform(srcIm, srcPoints, dstIm, dstPoints):
 	return Image.fromarray(targetArr)
 
 
+def getDelaunayTriangles(rect, faceLandmarks):
+
+	#using Subdiv2D and delaunays triangulate to triangulate the face
+	subdiv = cv2.Subdiv2D(rect)
+	
+	for landmark in faceLandmarks :
+		subdiv.insert(landmark)
+
+	# We are getting a list of points of delaunays' triangles
+	# eg : aTriangle = ( (x1,y1), (x2,y2), (x3,y3) )
+	triangleList = subdiv.getTriangleList()
+	
+	# We are recreating a list of delaunays' triangles but this time  
+	# we want the indexes of landmarks and not coordinates of points
+	delaunayTri = []
+	for tri in triangleList:
+		pt = []
+
+		pt.append((tri[0], tri[1]))
+		pt.append((tri[2], tri[3]))
+		pt.append((tri[4], tri[5]))
+
+		#searching for corespondance between landmarks idx and delaunays triangles coordinates
+		triIdxs = []
+		for j in range(0, 3):
+			for k in range(0, len(faceLandmarks)):
+				if (abs(pt[j][0] - faceLandmarks[k][0]) < 1.0 and abs(pt[j][1] - faceLandmarks[k][1]) < 1.0):
+					triIdxs.append(k)
+		if len(triIdxs) == 3:
+			delaunayTri.append((triIdxs[0], triIdxs[1], triIdxs[2]))
+
+
+	return delaunayTri
+
+
+#From two triangles (one of each images) calculate the affine transform
+#and output the target image with the source triangle
+def applyAffineTransform(srcImg, srcTri, targTri, sizeTargRect) :
+	#get the affine transform from the two triangles
+	mat = cv2.getAffineTransform(np.float32(srcTri), np.float32(targTri))
+	
+	#apply the affine transform to the source image
+	targ = cv2.warpAffine( srcImg, mat, (sizeTargRect[0], sizeTargRect[1]), borderMode=cv2.BORDER_REFLECT_101 )
+
+	return targ
+
+
+#Warp and blend a triangular region of the source face into the target face
+def warpTriangle(img1, img2, tri1, tri2):
+	#Get the bounding rectangle of the triangles
+	# note :: r[0] : x, r[1] : y, r[2] : w, r[3] : h
+	r1 = cv2.boundingRect(np.float32([tri1])) 
+	r2 = cv2.boundingRect(np.float32([tri2])) 
+
+	#Get coordinates of the triangles corresponding to the bounding rectangle
+	tri1Rect = []
+	tri2Rect = []
+	
+	for i in range(0,3):
+		tri1Rect.append( ((tri1[i][0] - r1[0]), (tri1[i][1] - r1[1])) ) 
+		tri2Rect.append( ((tri2[i][0] - r2[0]), (tri2[i][1] - r2[1])) ) 
+		
+	#Creating the mask in the shape of the triangle (in B&W)
+	mask = np.zeros( (r2[3], r2[2], 3), dtype = np.float32 )
+	cv2.fillConvexPoly(mask, np.int32(tri2Rect), (1.0,1.0,1.0))
+	
+	#get the rectangle part of the image
+	img1Rect = img1[r1[1]:r1[1] + r1[3], r1[0]:r1[0] + r1[2]]
+
+	sizeTargRect = (r2[2], r2[3])
+
+	#apply the affine transform
+	img2Rect = applyAffineTransform(img1Rect, tri1Rect, tri2Rect, sizeTargRect)
+
+	#And applying the mask to the bounding rectangle image
+	img2Rect = img2Rect * mask
+
+	#Copy the actual region of the face we want (triangle) to the output image
+	img2[r2[1]:r2[1]+r2[3], r2[0]:r2[0]+r2[2]] = img2[r2[1]:r2[1]+r2[3], r2[0]:r2[0]+r2[2]] * ( (1.0, 1.0, 1.0) - mask )
+
+	img2[r2[1]:r2[1]+r2[3], r2[0]:r2[0]+r2[2]] = img2[r2[1]:r2[1]+r2[3], r2[0]:r2[0]+r2[2]] + img2Rect
+
+
 
 def createMaskFromImg(lmPoints, img):
 	#Reduce mask by around 3 pixels (Erosion Opencv)
@@ -230,15 +293,13 @@ def createMaskFromImg(lmPoints, img):
 	return hull, mask
 
 
-def seamlessCloneImgs( srcIm, dstIm, cvDstIm, lmPointsSrc, lmPointsDst ):
-
-	#Perform transform
-	swappedFacesImg = PiecewiseAffineTransform(srcIm, lmPointsSrc, dstIm, lmPointsDst)
+def seamlessCloneImgs( swappedFacesImg, cvDstIm, lmPointsDst, imgIsCv=True ):
 
 	#convert the after warp image in opencv image type
-	swappedFacesImg = np.array(swappedFacesImg)
-	swappedFacesImg = swappedFacesImg[:,:,::-1].copy()
-	#cv2.imwrite("swappedFacesImg.jpg", swappedFacesImg)
+	if not imgIsCv:
+		swappedFacesImg = np.array(swappedFacesImg)
+		swappedFacesImg = swappedFacesImg[:,:,::-1].copy()
+		#cv2.imwrite("swappedFacesImg.jpg", swappedFacesImg)
 
 	hull, mask = createMaskFromImg(lmPointsDst, cvDstIm)
 	kernel = np.ones((5,5),np.uint8)
@@ -250,10 +311,11 @@ def seamlessCloneImgs( srcIm, dstIm, cvDstIm, lmPointsSrc, lmPointsDst ):
 	center = ((r[0]+int(r[2]/2), r[1]+int(r[3]/2)))
 
 	# Clone seamlessly.
-	output = cv2.seamlessClone(np.uint8(swappedFacesImg), cvDstIm, mask, center, cv2.MIXED_CLONE)
+	output = cv2.seamlessClone(np.uint8(swappedFacesImg), cvDstIm, mask, center, cv2.NORMAL_CLONE)
 	#cv2.imwrite("Output.jpg", output)
 
 	return output
+
 	
 def imageResize(image, height):
 	dim = None
@@ -270,33 +332,74 @@ def imageResize(image, height):
 	# return the resized image
 	return resized
 
+def faceSwapWithId(srcImg, srcLmPoints, dstImg, dstLmPoints):
+ 
+	srcImgWarped = np.copy(dstImg);  
+
+	# Find convex hull
+	hull1 = []
+	hull2 = []
+
+	hullIndex = cv2.convexHull(np.array(dstLmPoints), returnPoints = False)
+	  
+	for i in range(0, len(hullIndex)):
+		hull1.append(srcLmPoints[int(hullIndex[i])])
+		hull2.append(dstLmPoints[int(hullIndex[i])])
+    
+    
+	# Find delanauy traingulation for convex hull points
+	sizeDstImg = dstImg.shape
+	rect = (0, 0, sizeDstImg[1], sizeDstImg[0])
+
+	dt = getDelaunayTriangles(rect, hull2)
+
+	if len(dt) == 0:
+		quit()
+
+
+	# Apply affine transformation to Delaunay triangles
+	for i in range(0, len(dt)):
+		t1 = []
+		t2 = []
+
+		#get points for img1, img2 corresponding to the triangles
+		for j in range(0, 3):
+			t1.append(hull1[dt[i][j]])
+			t2.append(hull2[dt[i][j]])
+
+		warpTriangle(srcImg, srcImgWarped, t1, t2)
+
+	return srcImgWarped
+
+
 
 def faceSwap(srcImgPath, dstImgPath) : 
 	#Load images
 	srcIm = Image.open(srcImgPath)
 	dstIm = Image.open(dstImgPath)
+
+	#reading the images (with opencv)
+	cvImg1 = cv2.imread(srcImgPath, cv2.IMREAD_COLOR)
+	cvImg2 = cv2.imread(dstImgPath, cv2.IMREAD_COLOR)
 	
 	#Get faces landmarks
-	cvImg1, lmPoints1 = getLandmarksFromImg(srcImgPath)
-	cvImg2, lmPoints2 = getLandmarksFromImg(dstImgPath)
+	lmPoints1 = getLandmarksFromImg(cvImg1)
+	lmPoints2 = getLandmarksFromImg(cvImg2)
 
-	faceOnlyLm1 = []
-	faceOnlyLm2 = []
-	for group in OVERLAY_POINTS:
-		for p in group:
-			faceOnlyLm1.append(lmPoints1[p])
-			faceOnlyLm2.append(lmPoints2[p])
+	#Perform swapping (Identity not preserved)
+	output_NoID = PiecewiseAffineTransform(srcIm, lmPoints1, dstIm, lmPoints2)
+	output_NoID_seamLessCloning = seamlessCloneImgs( output_NoID, cvImg2, lmPoints2, imgIsCv=False)
 
-	#Perform swapping
-	output_NoID = seamlessCloneImgs( srcIm, dstIm, cvImg2, lmPoints1, lmPoints2 )
-	output_ID = seamlessCloneImgs( srcIm, dstIm, cvImg2, faceOnlyLm1, faceOnlyLm2 )
+	#Perform swapping (Identity preserved)
+	output_ID = faceSwapWithId(cvImg1, lmPoints1, cvImg2, lmPoints2)
+	newLmAfterSwap = getLandmarksFromImg(output_ID)
+	output_ID_seamLessCloning = seamlessCloneImgs( output_ID, cvImg2, lmPoints2 )
 
-
-	#Create a combined image with: source image + destination image + identity preserved + identity not preserved
+	#Create a combined image with: source image + destination image + identity not preserved +identity preserved
 	(h, w) = cvImg2.shape[:2]
 	cvImg1 = imageResize(cvImg1, h)
-	combinedImg = np.concatenate((cvImg1, cvImg2, output_NoID, output_ID), axis=1)
-	#cv2.imwrite("Result.jpg", combinedImg)
+	combinedImg = np.concatenate((cvImg1, cvImg2, output_NoID_seamLessCloning, output_ID_seamLessCloning), axis=1)
+	cv2.imwrite("Result.jpg", combinedImg)
 	
 	return combinedImg, h
 
